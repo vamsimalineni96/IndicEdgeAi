@@ -1,0 +1,28 @@
+# Model files (large, never commit these)
+models/
+*.gguf
+*.bin
+*.safetensors
+
+# Results (commit manually when ready to share)
+results/*.csv
+!results/.gitkeep
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+*.egg-info/
+dist/
+build/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
