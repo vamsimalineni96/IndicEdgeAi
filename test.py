@@ -1,70 +1,107 @@
-import os
-import torch
-from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
-from IndicTransToolkit.processor import IndicProcessor
-from indic_transliteration import sanscript
-from indic_transliteration.sanscript import transliterate
+"""
+test.py — Sanity check for the IndicEdgeAI pipeline.
 
-HF_TOKEN = os.environ.get("HF_TOKEN", "")
-if HF_TOKEN:
-    try:
-        from huggingface_hub import login
-        login(HF_TOKEN)
-        print("logged in to hf hub")
-    except Exception:
-        pass
+Runs a single MedQA-style record through both translation and transliteration
+to verify the full pipeline is working before processing a large dataset.
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+Usage:
+    python test.py
+    python test.py --lang telugu --mode translation
+"""
 
-# ── Load model ─────────────────────────────────────────────────────────────────
-print("Loading model...")
-model_name = "ai4bharat/indictrans2-en-indic-1B"
-tokenizer  = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-model      = AutoModelForSeq2SeqLM.from_pretrained(
-    model_name,
-    trust_remote_code=True,
-    torch_dtype=torch.float32,   # float32 for CPU stability
-).to(DEVICE)
-model.eval()
-ip = IndicProcessor(inference=True)
-print("Model ready.\n")
+import argparse
+import json
+import logging
+import sys
 
-# ── Sample sentence ────────────────────────────────────────────────────────────
-sentence = "The patient has a history of hypertension and diabetes."
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("test")
 
 
-# ── 1. TRANSLATION (meaning converted to target language) ──────────────────────
-def translate(text: str, tgt_lang: str) -> str:
-    batch  = ip.preprocess_batch([text], src_lang="eng_Latn", tgt_lang=tgt_lang)
-    inputs = tokenizer(batch, truncation=True, padding="longest", return_tensors="pt").to(DEVICE)
-    with torch.no_grad():
-        tokens = model.generate(**inputs, max_length=256, num_beams=4)
-    raw = tokenizer.batch_decode(tokens, skip_special_tokens=True)
-    return ip.postprocess_batch(raw, lang=tgt_lang)[0]
-
-hindi_translation  = translate(sentence, "hin_Deva")
-telugu_translation = translate(sentence, "tel_Telu")
-
-print("=" * 60)
-print("TRANSLATION")
-print("=" * 60)
-print(f"English : {sentence}")
-print(f"Hindi   : {hindi_translation}")
-print(f"Telugu  : {telugu_translation}")
+SAMPLE_RECORD = {
+    "id": "sanity-0",
+    "question": "A 45-year-old patient presents with a history of hypertension and type 2 diabetes. Which medication is most appropriate?",
+    "options": {
+        "A": "Metformin",
+        "B": "Lisinopril",
+        "C": "Atorvastatin",
+        "D": "Amoxicillin",
+    },
+    "answer": "B",
+}
 
 
-# ── 2. TRANSLITERATION (English phonetics written in target script) ─────────────
-# Uses ITRANS scheme: write English phonetically then convert to script
-# e.g.  "doctor ne tablet diya" → "डॉक्टर ने टैबलेट दिया"
-itrans_text = "patient ko hypertension aur diabetes ki history hai"
+def run_translation(lang: str) -> None:
+    from src.model import login_hf, load_translation_model
+    from src.translation import LANG_CODES, translate_fields
 
-hindi_translit  = transliterate(itrans_text, sanscript.ITRANS, sanscript.DEVANAGARI)
-telugu_translit = transliterate(itrans_text, sanscript.ITRANS, sanscript.TELUGU)
+    if lang not in LANG_CODES:
+        log.error("Unsupported lang '%s'. Valid: %s", lang, sorted(LANG_CODES))
+        sys.exit(1)
 
-print()
-print("=" * 60)
-print("TRANSLITERATION  (ITRANS phonetic → script)")
-print("=" * 60)
-print(f"ITRANS  : {itrans_text}")
-print(f"Hindi   : {hindi_translit}")
-print(f"Telugu  : {telugu_translit}")
+    login_hf()
+    load_translation_model()  # warm up
+
+    texts = {
+        "question": [SAMPLE_RECORD["question"]],
+        **{f"option_{k}": [v] for k, v in SAMPLE_RECORD["options"].items()},
+    }
+
+    results = translate_fields(texts, lang=lang, batch_size=1)
+
+    print(f"\n{'=' * 60}")
+    print(f"TRANSLATION → {lang.upper()}")
+    print(f"{'=' * 60}")
+    print(f"  Question EN : {SAMPLE_RECORD['question']}")
+    print(f"  Question    : {results['question'][0]}")
+    for k in sorted(SAMPLE_RECORD["options"]):
+        print(f"  Option {k}  EN : {SAMPLE_RECORD['options'][k]}")
+        print(f"  Option {k}     : {results[f'option_{k}'][0]}")
+
+
+def run_transliteration(lang: str) -> None:
+    from src.transliteration import SCRIPT_MAP, transliterate_fields
+
+    if lang not in SCRIPT_MAP:
+        log.error("Unsupported lang '%s'. Valid: %s", lang, sorted(SCRIPT_MAP))
+        sys.exit(1)
+
+    texts = {
+        "question": [SAMPLE_RECORD["question"]],
+        **{f"option_{k}": [v] for k, v in SAMPLE_RECORD["options"].items()},
+    }
+
+    results = transliterate_fields(texts, lang=lang)
+
+    print(f"\n{'=' * 60}")
+    print(f"TRANSLITERATION → {lang.upper()}")
+    print(f"{'=' * 60}")
+    print(f"  Question EN : {SAMPLE_RECORD['question']}")
+    print(f"  Question    : {results['question'][0]}")
+    for k in sorted(SAMPLE_RECORD["options"]):
+        print(f"  Option {k}  EN : {SAMPLE_RECORD['options'][k]}")
+        print(f"  Option {k}     : {results[f'option_{k}'][0]}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Sanity check for the IndicEdgeAI pipeline")
+    parser.add_argument("--lang", default="hindi", help="Target language (default: hindi)")
+    parser.add_argument(
+        "--mode", default="both", choices=["translation", "transliteration", "both"],
+        help="Which mode to test (default: both)",
+    )
+    args = parser.parse_args()
+
+    print(f"\nSample record:\n{json.dumps(SAMPLE_RECORD, indent=2, ensure_ascii=False)}\n")
+
+    if args.mode in ("translation", "both"):
+        run_translation(args.lang)
+
+    if args.mode in ("transliteration", "both"):
+        run_transliteration(args.lang)
+
+    print("\n[PASS] Sanity check complete.")
+
+
+if __name__ == "__main__":
+    main()
