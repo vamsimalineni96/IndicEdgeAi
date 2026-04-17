@@ -1,25 +1,3 @@
-# Core ML
-torch>=2.1.0
-transformers>=4.40.0
-accelerate>=0.28.0
-sentencepiece>=0.2.0
-
-# HuggingFace ecosystem
-huggingface_hub>=0.22.0
-datasets>=2.18.0
-
-# IndicTrans2 — install separately (not on PyPI):
-#   pip install git+https://github.com/VarunGumma/IndicTransToolkit.git
-# IndicTransToolkit
-
-# Transliteration
-indic-transliteration>=2.3.0
-ai4bharat-transliteration>=1.1.0   # optional but recommended (neural backend)
-
-# Evaluation
-sacrebleu>=2.4.0
-
-# Utilities
-tqdm>=4.66.0
-psutil>=5.9.0
-pandas>=2.0.0
+vllm
+nltk
+rouge-score
