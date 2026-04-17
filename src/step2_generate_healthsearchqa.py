@@ -9,7 +9,7 @@ Usage:
 
     Example:
     python step2_generate_healthsearchqa.py \
-        --endpoint https://your-nim-endpoint.com/v1/chat/completions \
+        --endpoint http://0.0.0.21:8000/v1/chat/completions \
         --api_key <KEY>
 
     Optional:
@@ -199,7 +199,7 @@ def main():
 
     # ── Download HealthSearchQA ─────────────────────────────────────
     print("\n[1/3] Downloading HealthSearchQA...")
-    ds = load_dataset("katielink/healthsearchqa")
+    ds = load_dataset("katielink/healthsearchqa", "all_data")
 
     if "train" in ds:
         data = ds["train"]
