@@ -1,11 +1,22 @@
 """
-Step 2: Generate Answers for HealthSearchQA
-=============================================
-Uses Qwen2.5-7B (teacher model) to generate high-quality answers
-for the 3.1K consumer health questions from HealthSearchQA.
+Step 2: Generate Answers for HealthSearchQA (via NIM Endpoint)
+===============================================================
+Uses Qwen2.5-7B deployed as a NIM service to generate high-quality
+answers for the 3.1K consumer health questions from HealthSearchQA.
 
 Usage:
-    python step2_generate_healthsearchqa.py [--backend transformers|vllm]
+    python step2_generate_healthsearchqa.py --endpoint <YOUR_NIM_URL>
+
+    Example:
+    python step2_generate_healthsearchqa.py \
+        --endpoint https://your-nim-endpoint.com/v1/chat/completions \
+        --api_key <KEY>
+
+    Optional:
+    --api_key <KEY>          API key if your NIM requires auth
+    --concurrency 10         Number of parallel requests (default: 10)
+    --batch_size 50          Save checkpoint every N responses (default: 50)
+    --model_name <NAME>      Model name to send in request (default: Qwen/Qwen2.5-7B-Instruct)
 
 Output:
     data/curated/healthsearchqa_with_answers.json
@@ -15,13 +26,14 @@ import json
 import os
 import argparse
 import time
+import asyncio
+import aiohttp
 from datasets import load_dataset
 
 # ── Config ──────────────────────────────────────────────────────────────
-MODEL_PATH = "Qwen/Qwen2.5-7B-Instruct"
 OUTPUT_DIR = "data/curated"
 OUTPUT_FILE = os.path.join(OUTPUT_DIR, "healthsearchqa_with_answers.json")
-BATCH_SIZE = 8  # For vLLM batching
+CHECKPOINT_FILE = os.path.join(OUTPUT_DIR, "healthsearchqa_checkpoint.json")
 
 SYSTEM_PROMPT = """You are a knowledgeable and empathetic medical assistant. 
 Answer the patient's health question clearly and accurately. 
@@ -32,120 +44,169 @@ Always include a brief disclaimer that this is general health information, not a
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
-def build_prompt(question):
-    """Build the chat prompt for answer generation."""
-    return [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": question},
-    ]
+def build_request_body(question, model_name):
+    """Build the OpenAI-compatible chat completion request."""
+    return {
+        "model": model_name,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": question},
+        ],
+        "max_tokens": 512,
+        "temperature": 0.7,
+        "top_p": 0.9,
+    }
 
 
-def generate_with_transformers(questions):
-    """Generate answers using HuggingFace transformers pipeline."""
-    from transformers import AutoTokenizer, AutoModelForCausalLM
-    import torch
+async def call_nim(session, endpoint, question, model_name, api_key=None, retries=3):
+    """Call the NIM endpoint for a single question with retries."""
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
 
-    print("   Loading model with transformers backend...")
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_PATH,
-        torch_dtype=torch.bfloat16,
-        device_map="auto",
-        trust_remote_code=True,
-    )
+    body = build_request_body(question, model_name)
 
-    results = []
-    total = len(questions)
+    for attempt in range(retries):
+        try:
+            async with session.post(
+                endpoint, json=body, headers=headers,
+                timeout=aiohttp.ClientTimeout(total=60),
+                ssl=False,
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    answer = data["choices"][0]["message"]["content"].strip()
+                    return answer
+                elif resp.status == 429:
+                    wait = 2 ** (attempt + 1)
+                    print(f"   ⚠ Rate limited, waiting {wait}s...")
+                    await asyncio.sleep(wait)
+                    continue
+                else:
+                    error_text = await resp.text()
+                    print(f"   ⚠ HTTP {resp.status}: {error_text[:150]}")
+                    await asyncio.sleep(1)
+        except asyncio.TimeoutError:
+            print(f"   ⚠ Timeout on attempt {attempt + 1}")
+            await asyncio.sleep(2)
+        except Exception as e:
+            print(f"   ⚠ Error: {type(e).__name__}: {e}")
+            await asyncio.sleep(1)
 
-    for i, question in enumerate(questions):
-        if (i + 1) % 50 == 0 or i == 0:
-            print(f"   Generating answer {i+1}/{total}...")
-
-        messages = build_prompt(question)
-        text = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
-        inputs = tokenizer(text, return_tensors="pt").to(model.device)
-
-        with torch.no_grad():
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=512,
-                temperature=0.7,
-                top_p=0.9,
-                do_sample=True,
-                pad_token_id=tokenizer.eos_token_id,
-            )
-
-        # Decode only the new tokens
-        generated = outputs[0][inputs["input_ids"].shape[1]:]
-        answer = tokenizer.decode(generated, skip_special_tokens=True).strip()
-        results.append(answer)
-
-    del model
-    torch.cuda.empty_cache()
-    return results
+    return None  # Failed after all retries
 
 
-def generate_with_vllm(questions):
-    """Generate answers using vLLM for faster batched inference."""
-    from vllm import LLM, SamplingParams
+async def generate_all(endpoint, questions, model_name, api_key=None, concurrency=10, batch_size=50):
+    """Generate answers for all questions with concurrency control."""
+    semaphore = asyncio.Semaphore(concurrency)
+    results = [None] * len(questions)
+    completed = 0
+    failed = 0
 
-    print("   Loading model with vLLM backend...")
-    llm = LLM(
-        model=MODEL_PATH,
-        trust_remote_code=True,
-        dtype="bfloat16",
-        max_model_len=2048,
-    )
+    # Load checkpoint if exists
+    if os.path.exists(CHECKPOINT_FILE):
+        with open(CHECKPOINT_FILE, "r") as f:
+            checkpoint = json.load(f)
+        for i, ans in enumerate(checkpoint):
+            if i < len(results) and ans is not None:
+                results[i] = ans
+        completed = sum(1 for r in results if r is not None)
+        print(f"   Resuming from checkpoint: {completed}/{len(questions)} already done")
 
-    sampling_params = SamplingParams(
-        temperature=0.7,
-        top_p=0.9,
-        max_tokens=512,
-    )
+    async def process_one(idx, question):
+        nonlocal completed, failed
+        if results[idx] is not None:
+            return
 
-    # Build all prompts
-    from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True)
+        async with semaphore:
+            answer = await call_nim(session, endpoint, question, model_name, api_key)
+            if answer:
+                results[idx] = answer
+            else:
+                results[idx] = ""
+                failed += 1
+            completed += 1
 
-    prompts = []
-    for q in questions:
-        messages = build_prompt(q)
-        text = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
-        prompts.append(text)
+            if completed % 100 == 0:
+                pct = completed / len(questions) * 100
+                print(f"   Progress: {completed}/{len(questions)} ({pct:.1f}%) | Failed: {failed}")
 
-    print(f"   Generating answers for {len(prompts)} questions (batched)...")
-    outputs = llm.generate(prompts, sampling_params)
+            if completed % batch_size == 0:
+                with open(CHECKPOINT_FILE, "w") as f:
+                    json.dump(results, f)
 
-    results = [output.outputs[0].text.strip() for output in outputs]
-    return results
+    connector = aiohttp.TCPConnector(limit=concurrency)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        tasks = [process_one(i, q) for i, q in enumerate(questions)]
+        await asyncio.gather(*tasks)
+
+    # Final checkpoint
+    with open(CHECKPOINT_FILE, "w") as f:
+        json.dump(results, f)
+
+    return results, failed
+
+
+def test_endpoint(endpoint, model_name, api_key=None):
+    """Quick connectivity test before starting bulk generation."""
+    import requests
+
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    body = build_request_body("What causes headaches?", model_name)
+
+    try:
+        resp = requests.post(endpoint, json=body, headers=headers, timeout=30, verify=False)
+        if resp.status_code == 200:
+            test_answer = resp.json()["choices"][0]["message"]["content"]
+            print(f"   ✓ Endpoint working!")
+            print(f"     Test response: '{test_answer[:100]}...'")
+            return True
+        else:
+            print(f"   ✗ HTTP {resp.status_code}: {resp.text[:300]}")
+            return False
+    except Exception as e:
+        print(f"   ✗ Connection failed: {e}")
+        return False
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--backend", default="transformers", choices=["transformers", "vllm"])
+    parser = argparse.ArgumentParser(description="Generate HealthSearchQA answers via NIM endpoint")
+    parser.add_argument("--endpoint", required=True,
+                        help="NIM endpoint URL (e.g. https://your-nim/v1/chat/completions)")
+    parser.add_argument("--api_key", default=None,
+                        help="API key for NIM endpoint (or set NIM_API_KEY env var)")
+    parser.add_argument("--model_name", default="Qwen/Qwen2.5-7B-Instruct",
+                        help="Model name to send in the request body")
+    parser.add_argument("--concurrency", type=int, default=10,
+                        help="Number of parallel requests (default: 10)")
+    parser.add_argument("--batch_size", type=int, default=50,
+                        help="Checkpoint save frequency (default: 50)")
     args = parser.parse_args()
 
+    # Check env var for API key
+    api_key = args.api_key or os.environ.get("NIM_API_KEY")
+
     print("=" * 60)
-    print("  STEP 2: Generate HealthSearchQA Answers")
+    print("  STEP 2: Generate HealthSearchQA Answers (NIM)")
     print("=" * 60)
+    print(f"  Endpoint:    {args.endpoint}")
+    print(f"  Model:       {args.model_name}")
+    print(f"  Concurrency: {args.concurrency}")
+    print(f"  Auth:        {'Yes' if api_key else 'No'}")
 
     # ── Download HealthSearchQA ─────────────────────────────────────
     print("\n[1/3] Downloading HealthSearchQA...")
     ds = load_dataset("katielink/healthsearchqa")
-    
-    # The dataset might have different structures, let's handle both
+
     if "train" in ds:
         data = ds["train"]
     else:
-        # Try to get the first available split
         split_name = list(ds.keys())[0]
         data = ds[split_name]
 
-    # Extract questions
     questions = []
     for example in data:
         q = example.get("question", "") or example.get("text", "")
@@ -155,26 +216,34 @@ def main():
     print(f"   Found {len(questions)} health questions")
     print(f"   Sample: '{questions[0]}'")
 
+    # ── Test endpoint ───────────────────────────────────────────────
+    print(f"\n[2/3] Testing NIM endpoint...")
+    if not test_endpoint(args.endpoint, args.model_name, api_key):
+        print("\n   Endpoint test failed. Please check:")
+        print("   - Is the NIM service running?")
+        print("   - Is the URL correct? (should end with /v1/chat/completions)")
+        print("   - Is the API key correct?")
+        resp = input("   Continue anyway? (y/n): ").strip().lower()
+        if resp != "y":
+            return
+
     # ── Generate answers ────────────────────────────────────────────
-    print(f"\n[2/3] Generating answers using {args.backend} backend...")
+    print(f"\n[3/3] Generating answers for {len(questions)} questions...")
     start_time = time.time()
 
-    if args.backend == "vllm":
-        answers = generate_with_vllm(questions)
-    else:
-        answers = generate_with_transformers(questions)
+    answers, failed = asyncio.run(
+        generate_all(
+            args.endpoint, questions, args.model_name,
+            api_key, args.concurrency, args.batch_size
+        )
+    )
 
     elapsed = time.time() - start_time
-    print(f"   Generated {len(answers)} answers in {elapsed:.1f}s")
-    print(f"   ({elapsed/len(answers):.2f}s per question)")
 
     # ── Format and save ─────────────────────────────────────────────
-    print(f"\n[3/3] Formatting and saving...")
-
     formatted = []
     skipped = 0
     for q, a in zip(questions, answers):
-        # Skip if answer is too short or empty
         if not a or len(a.strip()) < 50:
             skipped += 1
             continue
@@ -192,6 +261,10 @@ def main():
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         json.dump(formatted, f, ensure_ascii=False, indent=2)
 
+    # Clean up checkpoint
+    if os.path.exists(CHECKPOINT_FILE):
+        os.remove(CHECKPOINT_FILE)
+
     avg_a_len = sum(len(ex["response"]) for ex in formatted) / len(formatted) if formatted else 0
 
     print("\n" + "=" * 60)
@@ -199,9 +272,11 @@ def main():
     print("=" * 60)
     print(f"  Questions processed:  {len(questions)}")
     print(f"  Answers generated:    {len(formatted)}")
+    print(f"  Failed requests:      {failed}")
     print(f"  Skipped (too short):  {skipped}")
     print(f"  Avg answer length:    {avg_a_len:.0f} chars")
-    print(f"  Time taken:           {elapsed:.1f}s")
+    print(f"  Time taken:           {elapsed:.1f}s ({elapsed/len(questions):.2f}s per question)")
+    print(f"  Throughput:           {len(questions)/elapsed:.1f} questions/sec")
     print(f"  Output:               {OUTPUT_FILE}")
     print("=" * 60)
 
